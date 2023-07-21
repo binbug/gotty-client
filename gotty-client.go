@@ -3,7 +3,6 @@ package gottyclient
 import (
 	"crypto/tls"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -137,15 +136,18 @@ type Client struct {
 	WriteMutex      *sync.Mutex
 	Output          io.Writer
 	poison          chan bool
+	SkipAuth        bool
 	SkipTLSVerify   bool
 	UseProxyFromEnv bool
 	Connected       bool
 	EscapeKeys      []byte
 	V2              bool
-	message         *gottyMessageType
+	Cookie          string
 	WSOrigin        string
+	WSUrl           string
 	User            string
 	Password        string
+	MessageProtocol MessageProtocol
 }
 
 type querySingleType struct {
@@ -154,6 +156,9 @@ type querySingleType struct {
 }
 
 func (c *Client) write(data []byte) error {
+	if data == nil {
+		return nil
+	}
 	c.WriteMutex.Lock()
 	defer c.WriteMutex.Unlock()
 	return c.Conn.WriteMessage(websocket.TextMessage, data)
@@ -161,6 +166,9 @@ func (c *Client) write(data []byte) error {
 
 // GetAuthToken retrieves an Auth Token from dynamic auth_token.js file
 func (c *Client) GetAuthToken() (string, error) {
+	if !c.SkipAuth {
+		return "", nil
+	}
 	target, header, err := GetAuthTokenURL(c.URL)
 	if err != nil {
 		return "", err
@@ -226,6 +234,14 @@ func (c *Client) Connect() error {
 	if err != nil {
 		return err
 	}
+
+	if c.WSUrl != "" {
+		target, err = url.Parse(c.WSUrl)
+		if err != nil {
+			return err
+		}
+	}
+
 	if c.User != "" {
 		basicAuth := c.User + ":" + c.Password
 		header.Add("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(basicAuth)))
@@ -233,6 +249,17 @@ func (c *Client) Connect() error {
 	if c.WSOrigin != "" {
 		header.Add("Origin", c.WSOrigin)
 	}
+
+	if c.Cookie != "" {
+		header.Add("Cookie", c.Cookie)
+	}
+
+	if c.MessageProtocol == nil {
+		c.MessageProtocol = &DefaultMessageProtocol{}
+	}
+
+	c.MessageProtocol.Init(c)
+
 	logrus.Debugf("Connecting to websocket: %q", target.String())
 	if c.SkipTLSVerify {
 		c.Dialer.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
@@ -247,66 +274,27 @@ func (c *Client) Connect() error {
 	c.Conn = conn
 	c.Connected = true
 
-	// Pass arguments and auth-token
-	query, err := GetURLQuery(c.URL)
-	if err != nil {
-		return err
-	}
-	querySingle := querySingleType{
-		Arguments: "?" + query.Encode(),
-		AuthToken: authToken,
-	}
-	queryJSON, err := json.Marshal(querySingle)
-	if err != nil {
-		logrus.Errorf("Failed to parse init message %v", err)
-		return err
-	}
-	// Send Json
-	logrus.Debugf("Sending arguments and auth-token")
-	err = c.write(queryJSON)
+	connectData, err := c.MessageProtocol.Connect(c.URL)
 	if err != nil {
 		return err
 	}
 
-	// Initialize message types for gotty
-	c.initMessageType()
+	if connectData != nil {
+		err = c.write(connectData)
+		if err != nil {
+			return err
+		}
+	}
 
 	go c.pingLoop()
 
 	return nil
 }
 
-// initMessageType initialize message types for gotty
-func (c *Client) initMessageType() {
-	if c.V2 {
-		c.message = &gottyMessageType{
-			output:         Output,
-			pong:           Pong,
-			setWindowTitle: SetWindowTitle,
-			setPreferences: SetPreferences,
-			setReconnect:   SetReconnect,
-			input:          Input,
-			ping:           Ping,
-			resizeTerminal: ResizeTerminal,
-		}
-	} else {
-		c.message = &gottyMessageType{
-			output:         OutputV1,
-			pong:           PongV1,
-			setWindowTitle: SetWindowTitleV1,
-			setPreferences: SetPreferencesV1,
-			setReconnect:   SetReconnectV1,
-			input:          InputV1,
-			ping:           PingV1,
-			resizeTerminal: ResizeTerminalV1,
-		}
-	}
-}
-
 func (c *Client) pingLoop() {
 	for {
 		logrus.Debugf("Sending ping")
-		err := c.write([]byte{c.message.ping})
+		err := c.write(c.MessageProtocol.Ping())
 		if err != nil {
 			logrus.Warnf("c.write: %v", err)
 		}
@@ -365,7 +353,7 @@ func (c *Client) Loop() error {
 	return nil
 }
 
-type winsize struct {
+type WindowSize struct {
 	Rows    uint16 `json:"rows"`
 	Columns uint16 `json:"columns"`
 }
@@ -415,13 +403,19 @@ func (c *Client) termsizeLoop(wg *sync.WaitGroup) poisonReason {
 	defer resetSignalSIGWINCH()
 
 	for {
-		if b, err := syscallTIOCGWINSZ(); err != nil {
+		if tws, err := getWindowSize(); err != nil {
 			logrus.Warn(err)
 		} else {
-			if err = c.write(append([]byte{c.message.resizeTerminal}, b...)); err != nil {
-				logrus.Warnf("ws.WriteMessage failed: %v", err)
+			data, err := c.MessageProtocol.WinSizeChange(tws)
+			if err != nil {
+				logrus.Warn(err)
+			} else {
+				if err = c.write(data); err != nil {
+					logrus.Warnf("ws.WriteMessage failed: %v", err)
+				}
 			}
 		}
+
 		select {
 		case <-c.poison:
 			/* Somebody poisoned the well; die */
@@ -471,7 +465,7 @@ func (c *Client) writeLoop(wg *sync.WaitGroup) poisonReason {
 
 					// Send 'Input' marker, as defined in GoTTY::client_context.go,
 					// followed by EOT (a translation of Ctrl-D for terminals)
-					err = c.write(append([]byte{c.message.input}, byte(4)))
+					err = c.write(c.MessageProtocol.EOF())
 
 					if err != nil {
 						return openPoison(fname, c.poison)
@@ -487,7 +481,7 @@ func (c *Client) writeLoop(wg *sync.WaitGroup) poisonReason {
 			}
 
 			data := buff[:size]
-			err = c.write(append([]byte{c.message.input}, data...))
+			err = c.write(c.MessageProtocol.Input(data))
 			if err != nil {
 				return openPoison(fname, c.poison)
 			}
@@ -524,30 +518,8 @@ func (c *Client) readLoop(wg *sync.WaitGroup) poisonReason {
 				}
 				return openPoison(fname, c.poison)
 			}
-			if len(msg.Data) == 0 {
 
-				logrus.Warnf("An error has occurred")
-				return openPoison(fname, c.poison)
-			}
-			switch msg.Data[0] {
-			case c.message.output: // data
-				buf, err := base64.StdEncoding.DecodeString(string(msg.Data[1:]))
-				if err != nil {
-					logrus.Warnf("Invalid base64 content: %q", msg.Data[1:])
-					break
-				}
-				_, _ = c.Output.Write(buf)
-			case c.message.pong: // pong
-			case c.message.setWindowTitle: // new title
-				newTitle := string(msg.Data[1:])
-				_, _ = fmt.Fprintf(c.Output, "\033]0;%s\007", newTitle)
-			case c.message.setPreferences: // json prefs
-				logrus.Debugf("Unhandled protocol message: json pref: %s", string(msg.Data[1:]))
-			case c.message.setReconnect: // autoreconnect
-				logrus.Debugf("Unhandled protocol message: autoreconnect: %s", string(msg.Data))
-			default:
-				logrus.Warnf("Unhandled protocol message: %s", string(msg.Data))
-			}
+			c.MessageProtocol.Output(msg.Data, c.Output)
 		}
 	}
 }

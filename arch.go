@@ -1,9 +1,9 @@
+//go:build !windows
 // +build !windows
 
 package gottyclient
 
 import (
-	"encoding/json"
 	"fmt"
 	"golang.org/x/sys/unix"
 	"os"
@@ -19,15 +19,10 @@ func resetSignalSIGWINCH() {
 	signal.Reset(syscall.SIGWINCH)
 }
 
-func syscallTIOCGWINSZ() ([]byte, error) {
+func getWindowSize() (*WindowSize, error) {
 	ws, err := unix.IoctlGetWinsize(0, unix.TIOCGWINSZ)
 	if err != nil {
 		return nil, fmt.Errorf("ioctl error: %v", err)
 	}
-	tws := winsize{Rows: ws.Row, Columns: ws.Col}
-	b, err := json.Marshal(tws)
-	if err != nil {
-		return nil, fmt.Errorf("json.Marshal error: %v", err)
-	}
-	return b, err
+	return &WindowSize{Rows: ws.Row, Columns: ws.Col}, nil
 }
