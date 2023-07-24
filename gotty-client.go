@@ -223,11 +223,15 @@ func (c *Client) GetAuthToken() (string, error) {
 // Connect tries to dial a websocket server
 func (c *Client) Connect() error {
 	// Retrieve AuthToken
-	authToken, err := c.GetAuthToken()
-	if err != nil {
-		return err
+	authToken := ""
+	if !c.SkipAuth {
+		a, err := c.GetAuthToken()
+		if err != nil {
+			return err
+		}
+		authToken = a
+		logrus.Debugf("Auth-token: %q", authToken)
 	}
-	logrus.Debugf("Auth-token: %q", authToken)
 
 	// Open WebSocket connection
 	target, header, err := GetWebsocketURL(c.URL)
